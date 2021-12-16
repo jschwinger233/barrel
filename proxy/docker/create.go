@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/projecteru2/barrel/cni/subhandler"
 	barrelHttp "github.com/projecteru2/barrel/http"
@@ -342,6 +343,13 @@ func (handler containerCreateHandler) adaptRequestForCNI(body utils.Object) (err
 		return
 	}
 
+	todo := []func(){}
+	defer func() {
+		for _, f := range todo {
+			f()
+		}
+	}()
+
 	if iNetworkMode, ok := hostConfig.Get("NetworkMode"); !ok || iNetworkMode.Null() {
 		return
 	} else if networkMode, ok = iNetworkMode.StringValue(); !ok {
@@ -350,11 +358,15 @@ func (handler containerCreateHandler) adaptRequestForCNI(body utils.Object) (err
 	if !isCustomNetwork(networkMode) {
 		return
 	}
-	env.Add(utils.NewStringNode("IPPOOL=" + networkMode))
 
-	logger.Info("cni mode enabled, set network none, set runtime barrel-cni")
-	hostConfig.Set("Runtime", utils.NewStringNode("barrel-cni"))
-	hostConfig.Set("NetworkMode", utils.NewStringNode("none"))
+	todo = append(todo,
+		func() {
+			logger.Info("cni mode enabled, set network none, add ippool env, set runtime barrel-cni")
+			env.Add(utils.NewStringNode("IPPOOL=" + networkMode))
+			hostConfig.Set("Runtime", utils.NewStringNode("barrel-cni"))
+			hostConfig.Set("NetworkMode", utils.NewStringNode("none"))
+		},
+	)
 	networkConfig, err := ensureObjectMember(body, "NetworkingConfig")
 	if err != nil {
 		return
@@ -372,16 +384,33 @@ func (handler containerCreateHandler) adaptRequestForCNI(body utils.Object) (err
 			specificIP, _ = ipv4Address.StringValue()
 		}
 	}
-	networkConfig.Set("EndpointsConfig", utils.NewObjectNode().Any())
+	todo = append(todo, func() {
+		logger.Info("cni mode enabled, empty EndpointConfig")
+		networkConfig.Set("EndpointsConfig", utils.NewObjectNode().Any())
+	})
 
 	if fixedIPLabel, ok := labels.Get(FixedIPLabel); ok && flagEnabled(fixedIPLabel) {
-		logger.Info("cni fixed-ip mode detected, set fixed-ip env")
-		env.Add(utils.NewStringNode(FixedIPLabel + "=1"))
+		todo = append(todo, func() {
+			logger.Info("cni fixed-ip mode detected, set fixed-ip env")
+			env.Add(utils.NewStringNode(FixedIPLabel + "=1"))
+		})
 	}
 
 	if specificIP != "" {
-		logger.Info("cni specific-ip mode detected, set ipv4 env")
-		env.Add(utils.NewStringNode("IPV4=" + specificIP))
+		todo = append(todo, func() {
+			logger.Info("cni specific-ip mode detected, set ipv4 env")
+			env.Add(utils.NewStringNode("IPV4=" + specificIP))
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := handler.vess.FixedIPAllocator().GetFixedIP(ctx, types.IP{Address: specificIP}, nil); err != nil {
+		if err == types.ErrFixedIPNotAllocated {
+			todo = []func(){}
+			return nil
+		}
+		return err
 	}
 
 	return nil
